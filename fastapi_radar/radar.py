@@ -1,24 +1,17 @@
 """Main Radar class for FastAPI Radar."""
 
-import asyncio
-import multiprocessing
 import os
-import sys
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional
 
 from fastapi import FastAPI
-from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
-from sqlalchemy.ext.asyncio import AsyncEngine
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+
+from tortoise import Tortoise
 
 from .api import create_api_router
 from .capture import QueryCapture
 from .middleware import RadarMiddleware
-from .models import Base
+from .models import CapturedRequest
 
 
 def is_reload_worker() -> bool:
@@ -29,17 +22,7 @@ def is_reload_worker() -> bool:
     if os.environ.get("WERKZEUG_RUN_MAIN"):
         return True
 
-    if hasattr(multiprocessing.current_process(), "name"):
-        process_name = multiprocessing.current_process().name
-        if process_name != "MainProcess" and "SpawnProcess" in process_name:
-            return True
-
     return False
-
-
-def is_windows() -> bool:
-    """Check if we're running on Windows."""
-    return sys.platform.startswith("win")
 
 
 class Radar:
@@ -48,8 +31,6 @@ class Radar:
     def __init__(
         self,
         app: FastAPI,
-        db_engine: Optional[Engine] = None,
-        storage_engine: Optional[Union[Engine, AsyncEngine]] = None,
         dashboard_path: str = "/__radar",
         max_requests: int = 1000,
         retention_hours: int = 24,
@@ -60,12 +41,10 @@ class Radar:
         enable_tracing: bool = True,
         service_name: str = "fastapi-app",
         include_in_schema: bool = True,
-        db_path: Optional[str] = None,
         auth_dependency: Optional[Callable] = None,
         max_body_size: int = 10000,
     ):
         self.app = app
-        self.db_engine = db_engine
         self.dashboard_path = dashboard_path
         self.max_requests = max_requests
         self.retention_hours = retention_hours
@@ -75,7 +54,6 @@ class Radar:
         self.theme = theme
         self.enable_tracing = enable_tracing
         self.service_name = service_name
-        self.db_path = db_path
         self.auth_dependency = auth_dependency
         self.max_body_size = max_body_size
         self.query_capture = None
@@ -84,109 +62,19 @@ class Radar:
             self.exclude_paths.append(dashboard_path)
         self.exclude_paths.append("/favicon.ico")
 
-        if storage_engine:
-            self.storage_engine = storage_engine
-        else:
-            storage_url = os.environ.get("RADAR_STORAGE_URL")
-            if storage_url:
-                if "duckdb" in storage_url:
-                    self.storage_engine = create_engine(storage_url, poolclass=StaticPool)
-                else:
-                    self.storage_engine = create_engine(storage_url)
-            else:
-                import duckdb_engine  # noqa: F401
-
-                if self.db_path:
-                    try:
-                        provided_path = Path(self.db_path).resolve()
-                        if provided_path.suffix.lower() == ".duckdb":
-                            radar_db_path = provided_path
-                            radar_db_path.parent.mkdir(parents=True, exist_ok=True)
-                        else:
-                            radar_db_path = provided_path / "radar.duckdb"
-                            provided_path.mkdir(parents=True, exist_ok=True)
-
-                    except Exception as e:
-                        import warnings
-
-                        warnings.warn(
-                            (
-                                f"Failed to create database path '{self.db_path}': {e}. "
-                                f"Using current directory."
-                            ),
-                            UserWarning,
-                        )
-
-                        radar_db_path = Path.cwd() / "radar.duckdb"
-                        radar_db_path.parent.mkdir(parents=True, exist_ok=True)
-                else:
-                    radar_db_path = Path.cwd() / "radar.duckdb"
-                    radar_db_path.parent.mkdir(parents=True, exist_ok=True)
-
-                if is_reload_worker():
-                    import warnings
-
-                    warnings.warn(
-                        "FastAPI Radar: Detected development mode with auto-reload. "
-                        "Using in-memory database to avoid file locking issues. "
-                        "Data will not persist between reloads.",
-                        UserWarning,
-                    )
-                    self.storage_engine = create_engine(
-                        "duckdb:///:memory:",
-                        connect_args={
-                            "read_only": False,
-                            "config": {"memory_limit": "500mb"},
-                        },
-                        poolclass=StaticPool,
-                    )
-                else:
-                    self.storage_engine = create_engine(
-                        f"duckdb:///{radar_db_path}",
-                        connect_args={
-                            "read_only": False,
-                            "config": {"memory_limit": "500mb"},
-                        },
-                        poolclass=StaticPool,
-                    )
-
-        # Check if storage_engine is async or sync
-        # If async, we'll use it for DDL operations but keep sessions sync
-        # by accessing the sync engine from the async engine
-        if isinstance(self.storage_engine, AsyncEngine):
-            # For async engines, get the underlying sync engine for session operations
-            # The middleware and other components use sessions synchronously
-            self._is_async_storage = True
-            sync_engine = self.storage_engine.sync_engine
-            self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=sync_engine)
-        else:
-            self._is_async_storage = False
-            self.SessionLocal = sessionmaker(
-                autocommit=False, autoflush=False, bind=self.storage_engine
-            )
-
         self._setup_middleware()
-
-        if self.db_engine:
-            self._setup_query_capture()
-
+        self._setup_query_capture()
         self._setup_api(include_in_schema=include_in_schema)
         self._setup_dashboard(include_in_schema=include_in_schema)
 
-    @contextmanager
-    def get_session(self) -> Session:
-        """Get a database session for radar storage."""
-        session = self.SessionLocal()
-        try:
-            yield session
-        finally:
-            session.close()
+        # Register cleanup task on startup?
+        # Or just let user call cleanup.
+        # Original code didn't auto cleanup.
 
     def _setup_middleware(self) -> None:
         """Add request capture middleware."""
         self.app.add_middleware(
             RadarMiddleware,
-            get_session=self.get_session,
             exclude_paths=self.exclude_paths,
             max_body_size=self.max_body_size,
             capture_response_body=True,
@@ -195,21 +83,16 @@ class Radar:
         )
 
     def _setup_query_capture(self) -> None:
-        """Setup SQLAlchemy query capture."""
-        assert (
-            self.db_engine is not None
-        ), "db_engine must be set before calling _setup_query_capture"
-
+        """Setup Tortoise ORM query capture."""
         self.query_capture = QueryCapture(
-            get_session=self.get_session,
             capture_bindings=self.capture_sql_bindings,
             slow_query_threshold=self.slow_query_threshold,
         )
-        self.query_capture.register(self.db_engine)
+        # Registration happens in QueryCapture.__init__
 
     def _setup_api(self, include_in_schema: bool) -> None:
         """Mount API endpoints."""
-        api_router = create_api_router(self.get_session, self.auth_dependency)
+        api_router = create_api_router(self.auth_dependency)
         self.app.include_router(api_router, include_in_schema=include_in_schema)
 
     def _setup_dashboard(self, include_in_schema: bool) -> None:
@@ -276,192 +159,33 @@ class Radar:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FastAPI Radar</title>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }}
-        .container {{
-            text-align: center;
-            max-width: 600px;
-        }}
-        h1 {{
-            font-size: 3rem;
-            margin-bottom: 1rem;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
-        }}
-        p {{
-            font-size: 1.2rem;
-            margin-bottom: 2rem;
-            opacity: 0.95;
-        }}
-        .stats {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 20px;
-            margin-top: 3rem;
-        }}
-        .stat {{
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            padding: 20px;
-            border-radius: 10px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-        }}
-        .stat-value {{
-            font-size: 2rem;
-            font-weight: bold;
-            margin-bottom: 5px;
-        }}
-        .stat-label {{
-            font-size: 0.9rem;
-            opacity: 0.8;
-        }}
-        .loading {{ animation: pulse 2s infinite; }}
-        @keyframes pulse {{
-            0%, 100% {{ opacity: 1; }}
-            50% {{ opacity: 0.5; }}
-        }}
-    </style>
 </head>
 <body>
     <div class="container">
         <h1>FastAPI Radar</h1>
-        <p>Real-time debugging dashboard loading...</p>
-        <div class="stats">
-            <div class="stat">
-                <div class="stat-value loading">--</div>
-                <div class="stat-label">Requests</div>
-            </div>
-            <div class="stat">
-                <div class="stat-value loading">--</div>
-                <div class="stat-label">Queries</div>
-            </div>
-            <div class="stat">
-                <div class="stat-value loading">--</div>
-                <div class="stat-label">Avg Response</div>
-            </div>
-            <div class="stat">
-                <div class="stat-value loading">--</div>
-                <div class="stat-label">Exceptions</div>
-            </div>
-        </div>
+        <p>Dashboard not built. Please run npm run build in fastapi_radar/dashboard.</p>
     </div>
-    <script>
-        async function loadStats() {{
-            try {{
-                const response = await fetch('/__radar/api/stats?hours=1');
-                const data = await response.json();
-
-                document.querySelectorAll('.stat-value')[0].textContent =
-                    data.total_requests;
-                document.querySelectorAll('.stat-value')[1].textContent =
-                    data.total_queries;
-                document.querySelectorAll('.stat-value')[2].textContent =
-                    data.avg_response_time ?
-                        `${{data.avg_response_time.toFixed(1)}}ms` : '--';
-                document.querySelectorAll('.stat-value')[3].textContent =
-                    data.total_exceptions;
-
-                document.querySelectorAll('.stat-value').forEach(el => {{
-                    el.classList.remove('loading');
-                }});
-            }} catch (error) {{
-                console.error('Failed to load stats:', error);
-            }}
-        }}
-
-        loadStats();
-        setInterval(loadStats, 5000);
-    </script>
 </body>
 </html>
-        """.replace(
-                "{theme}", self.theme
-            )
+        """.replace("{theme}", self.theme)
         )
 
-    def create_tables(self) -> None:
+    async def create_tables(self) -> None:
         """Create database tables.
 
-        With dev mode (fastapi dev), this safely handles
-        multiple process attempts to create tables.
-
-        Supports both sync and async storage engines.
+        This assumes Tortoise has been initialized by the application.
         """
-        try:
-            if isinstance(self.storage_engine, AsyncEngine):
-                # For async engines, we need to run the DDL in a sync context
-                async def _create_tables():
-                    async with self.storage_engine.begin() as conn:
-                        await conn.run_sync(Base.metadata.create_all)
+        await Tortoise.generate_schemas()
 
-                # Check if there's already an event loop running
-                try:
-                    asyncio.get_running_loop()
-                except RuntimeError:
-                    # No event loop running, safe to use asyncio.run()
-                    asyncio.run(_create_tables())
-                else:
-                    # Event loop is running, we need to run in a thread
-                    import concurrent.futures
+    async def drop_tables(self) -> None:
+        """Drop all Radar tables."""
+        await Tortoise._drop_databases()
 
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(asyncio.run, _create_tables())
-                        future.result()
-            else:
-                Base.metadata.create_all(bind=self.storage_engine)
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "already exists" not in error_msg and "lock" not in error_msg:
-                raise
-
-    def drop_tables(self) -> None:
-        """Drop all Radar tables.
-
-        Supports both sync and async storage engines.
-        """
-        if isinstance(self.storage_engine, AsyncEngine):
-            # For async engines, we need to run the DDL in a sync context
-            async def _drop_tables():
-                async with self.storage_engine.begin() as conn:
-                    await conn.run_sync(Base.metadata.drop_all)
-
-            # Check if there's already an event loop running
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                # No event loop running, safe to use asyncio.run()
-                asyncio.run(_drop_tables())
-            else:
-                # Event loop is running, we need to run in a thread
-                import concurrent.futures
-
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, _drop_tables())
-                    future.result()
-        else:
-            Base.metadata.drop_all(bind=self.storage_engine)
-
-    def cleanup(self, older_than_hours: Optional[int] = None) -> None:
+    async def cleanup(self, older_than_hours: Optional[int] = None) -> int:
         from datetime import datetime, timedelta, timezone
 
-        from .models import CapturedRequest
+        hours = older_than_hours or self.retention_hours
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-        with self.get_session() as session:
-            hours = older_than_hours or self.retention_hours
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-
-            deleted = (
-                session.query(CapturedRequest).filter(CapturedRequest.created_at < cutoff).delete()
-            )
-
-            session.commit()
-            return deleted
+        deleted_count = await CapturedRequest.filter(created_at__lt=cutoff).delete()
+        return deleted_count

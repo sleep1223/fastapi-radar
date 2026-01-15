@@ -3,7 +3,7 @@
 import secrets
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from sqlalchemy import create_engine
+from tortoise.contrib.fastapi import register_tortoise
 
 from fastapi_radar import Radar
 
@@ -28,16 +28,20 @@ def verify_radar_access(credentials: HTTPBasicCredentials = Depends(security)):
     return credentials
 
 
-# Setup database (optional)
-engine = create_engine("sqlite:///./app.db")
-
 # Initialize Radar with authentication
 radar = Radar(
     app,
-    db_engine=engine,
     auth_dependency=verify_radar_access,  # Secure the dashboard
 )
-radar.create_tables()
+
+# Initialize Tortoise ORM (Radar requires it)
+register_tortoise(
+    app,
+    db_url="sqlite://app.db",
+    modules={"models": ["fastapi_radar.models"]},
+    generate_schemas=True,
+    add_exception_handlers=True,
+)
 
 
 # Your regular API endpoints (not protected by Radar auth)

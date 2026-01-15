@@ -1,7 +1,6 @@
 """Tests for tracing functionality."""
 
 import pytest
-
 from fastapi_radar.models import Span, SpanRelation, Trace
 from fastapi_radar.tracing import (
     TraceContext,
@@ -156,12 +155,13 @@ class TestTraceContext:
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
 class TestTracingManager:
     """Test TracingManager class."""
 
-    def test_save_trace_context(self, mock_get_session, storage_session):
+    async def test_save_trace_context(self, db):
         """Test saving trace context to database."""
-        manager = TracingManager(mock_get_session)
+        manager = TracingManager()
         ctx = TraceContext("trace-456", "test-service")
 
         span1 = ctx.create_span("root operation")
@@ -171,24 +171,24 @@ class TestTracingManager:
         ctx.finish_span(span1)
         ctx.finish_span(span2)
 
-        manager.save_trace_context(ctx)
+        await manager.save_trace_context(ctx)
 
         # Verify trace was saved
-        traces = storage_session.query(Trace).all()
+        traces = await Trace.all()
         assert len(traces) == 1
         assert traces[0].trace_id == "trace-456"
 
         # Verify spans were saved
-        spans = storage_session.query(Span).all()
+        spans = await Span.all()
         assert len(spans) == 2
 
         # Verify relations were saved
-        relations = storage_session.query(SpanRelation).all()
+        relations = await SpanRelation.all()
         assert len(relations) == 1
 
-    def test_save_span_relations(self, mock_get_session, storage_session):
+    async def test_save_span_relations(self, db):
         """Test saving span relations."""
-        manager = TracingManager(mock_get_session)
+        manager = TracingManager()
         ctx = TraceContext("trace-789", "test-service")
 
         # Create a hierarchy: root -> child1 -> grandchild
@@ -198,28 +198,28 @@ class TestTracingManager:
         ctx.set_current_span(child1)
         _ = ctx.create_span("grandchild")
 
-        manager.save_trace_context(ctx)
+        await manager.save_trace_context(ctx)
 
-        relations = storage_session.query(SpanRelation).order_by(SpanRelation.depth).all()
+        relations = await SpanRelation.all().order_by("depth")
         assert len(relations) == 2
 
         # Check depths
         assert relations[0].depth == 1
         assert relations[1].depth == 2
 
-    def test_get_waterfall_data(self, mock_get_session, storage_session):
+    async def test_get_waterfall_data(self, db):
         """Test getting waterfall data."""
-        manager = TracingManager(mock_get_session)
+        manager = TracingManager()
 
         # Create and save a trace
         ctx = TraceContext("trace-waterfall", "test-service")
         span1 = ctx.create_span("operation 1")
         ctx.finish_span(span1)
 
-        manager.save_trace_context(ctx)
+        await manager.save_trace_context(ctx)
 
         # Get waterfall data
-        waterfall = manager.get_waterfall_data("trace-waterfall")
+        waterfall = await manager.get_waterfall_data("trace-waterfall")
 
         assert len(waterfall) == 1
         assert waterfall[0]["operation_name"] == "operation 1"

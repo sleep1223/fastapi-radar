@@ -1,135 +1,116 @@
-"""SQLAlchemy query capture for FastAPI Radar."""
+"""Tortoise ORM query capture for FastAPI Radar."""
 
 import time
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
-from sqlalchemy import event
-from sqlalchemy.engine import Engine
-
-try:  # SQLAlchemy async support is optional
-    from sqlalchemy.ext.asyncio import AsyncEngine
-except Exception:  # pragma: no cover - module might not exist in older SQLAlchemy
-    AsyncEngine = None  # type: ignore[assignment]
 from .middleware import request_context
 from .models import CapturedQuery
+from .tortoise_patch import QueryListener, add_query_listener, apply_tortoise_patch
 from .tracing import get_current_trace_context
 from .utils import format_sql
 
 
-class QueryCapture:
+class QueryCapture(QueryListener):
     def __init__(
         self,
-        get_session: Callable,
         capture_bindings: bool = True,
         slow_query_threshold: int = 100,
     ):
-        self.get_session = get_session
         self.capture_bindings = capture_bindings
         self.slow_query_threshold = slow_query_threshold
-        self._query_start_times = {}
-        self._registered_engines: Dict[int, Engine] = {}
 
-    def register(self, engine: Engine) -> None:
-        sync_engine = self._resolve_engine(engine)
-        event.listen(sync_engine, "before_cursor_execute", self._before_cursor_execute)
-        event.listen(sync_engine, "after_cursor_execute", self._after_cursor_execute)
-        self._registered_engines[id(engine)] = sync_engine
+        # Apply patch and register listener
+        apply_tortoise_patch()
+        add_query_listener(self)
 
-    def unregister(self, engine: Engine) -> None:
-        sync_engine = self._registered_engines.pop(id(engine), None)
-        if not sync_engine:
-            sync_engine = self._resolve_engine(engine)
-        event.remove(sync_engine, "before_cursor_execute", self._before_cursor_execute)
-        event.remove(sync_engine, "after_cursor_execute", self._after_cursor_execute)
+    async def before_query(self, query: str, values: list | None) -> Any:
+        # Prevent infinite loops by ignoring queries to radar tables
+        upper_query = query.strip().upper()
+        if "radar_" in query:
+            # Ignore internal radar queries
+            return None
 
-    def _before_cursor_execute(
-        self,
-        conn: Any,
-        cursor: Any,
-        statement: str,
-        parameters: Any,
-        context: Any,
-        executemany: bool,
-    ) -> None:
+        # Check if it is a DDL statement
+        is_ddl = any(upper_query.startswith(cmd) for cmd in ["CREATE", "DROP", "ALTER"])
+        if is_ddl:
+            return None
+
         request_id = request_context.get()
-        if not request_id:
-            return
-        context_id = id(context)
-        self._query_start_times[context_id] = time.time()
-        setattr(context, "_radar_request_id", request_id)
+
+        start_time = time.time()
+        context = {"start_time": start_time, "request_id": request_id}
+
         trace_ctx = get_current_trace_context()
         if trace_ctx:
-            formatted_sql = format_sql(statement)
-            operation_type = self._get_operation_type(statement)
-            db_tags = self._get_db_tags(conn)
+            formatted_sql = format_sql(query)
+            operation_type = self._get_operation_type(query)
+            db_tags = {
+                "db.system": "tortoise",
+                "db.statement": formatted_sql[:500],
+                "db.operation_type": operation_type,
+            }
             span_id = trace_ctx.create_span(
                 operation_name=f"DB {operation_type}",
                 span_kind="client",
-                tags={
-                    "db.statement": formatted_sql[:500],  # limit SQL length
-                    "db.operation_type": operation_type,
-                    "component": "database",
-                    **db_tags,
-                },
+                tags=db_tags,
             )
-            setattr(context, "_radar_span_id", span_id)
+            context["span_id"] = span_id
 
-    def _after_cursor_execute(
-        self,
-        conn: Any,
-        cursor: Any,
-        statement: str,
-        parameters: Any,
-        context: Any,
-        executemany: bool,
-    ) -> None:
-        request_id = request_context.get()
-        if not request_id:
-            request_id = getattr(context, "_radar_request_id", None)
-            if not request_id:
-                return
-        start_time = self._query_start_times.pop(id(context), None)
-        if start_time is None:
+        return context
+
+    async def after_query(self, ctx: Any, query: str, values: list | None, result: Any, exc: Exception | None) -> None:
+        if not ctx:
+            return
+
+        request_id = ctx.get("request_id")
+        start_time = ctx.get("start_time")
+        span_id = ctx.get("span_id")
+
+        if not start_time:
             return
 
         duration_ms = round((time.time() - start_time) * 1000, 2)
 
+        rows_affected = None
+        # Tortoise execute_query usually returns (rows_affected, resultset)
+        if isinstance(result, tuple) and len(result) >= 1:
+            rows_affected = result[0]
+
         trace_ctx = get_current_trace_context()
-        if trace_ctx and hasattr(context, "_radar_span_id"):
-            span_id = getattr(context, "_radar_span_id")
+        if trace_ctx and span_id:
             additional_tags = {
                 "db.duration_ms": duration_ms,
-                "db.rows_affected": (cursor.rowcount if hasattr(cursor, "rowcount") else None),
+                "db.rows_affected": rows_affected,
             }
+            if exc:
+                additional_tags["error"] = True
+                additional_tags["error.message"] = str(exc)
 
             status = "ok"
-            if duration_ms >= self.slow_query_threshold:
+            if exc:
+                status = "error"
+            elif duration_ms >= self.slow_query_threshold:
                 status = "slow"
                 additional_tags["db.slow_query"] = True
 
             trace_ctx.finish_span(span_id, status=status, tags=additional_tags)
 
-        if "radar_" in statement:
-            return
-
-        captured_query = CapturedQuery(
-            request_id=request_id,
-            sql=format_sql(statement),
-            parameters=(self._serialize_parameters(parameters) if self.capture_bindings else None),
-            duration_ms=duration_ms,
-            rows_affected=cursor.rowcount if hasattr(cursor, "rowcount") else None,
-            connection_name=(
-                str(conn.engine.url).split("@")[0] if hasattr(conn, "engine") else None
-            ),
-        )
-
+        # Save captured query
         try:
-            with self.get_session() as session:
-                session.add(captured_query)
-                session.commit()
-        except (
-            Exception
-        ):  # nosec B110 - Intentionally silent to prevent monitoring from breaking app
+            params_serialized = None
+            if self.capture_bindings and values:
+                params_serialized = self._serialize_parameters(values)
+
+            await CapturedQuery.create(
+                request_id=request_id,
+                sql=format_sql(query),
+                parameters=params_serialized,
+                duration_ms=duration_ms,
+                rows_affected=rows_affected,
+                connection_name="default",
+            )
+        except Exception:
+            # Prevent monitoring from breaking app
             pass
 
     def _get_operation_type(self, statement: str) -> str:
@@ -160,24 +141,11 @@ class QueryCapture:
         if not parameters:
             return None
 
-        if isinstance(parameters, (list, tuple)):
-            return [str(p) for p in parameters[:100]]
-        elif isinstance(parameters, dict):
-            return {k: str(v) for k, v in list(parameters.items())[:100]}
-
-        return [str(parameters)]
-
-    def _resolve_engine(self, engine: Engine) -> Engine:
-        if AsyncEngine is not None and isinstance(engine, AsyncEngine):
-            return engine.sync_engine
-        return engine
-
-    def _get_db_tags(self, conn: Any) -> Dict[str, Optional[str]]:
-        tags: Dict[str, Optional[str]] = {}
-        engine = getattr(conn, "engine", None)
-        if engine and getattr(engine, "dialect", None):
-            tags["db.system"] = engine.dialect.name
-            url = getattr(engine, "url", None)
-            if url is not None:
-                tags["db.name"] = getattr(url, "database", None)
-        return tags
+        try:
+            if isinstance(parameters, (list, tuple)):
+                return [str(p) for p in parameters[:100]]
+            elif isinstance(parameters, dict):
+                return {k: str(v) for k, v in list(parameters.items())[:100]}
+            return [str(parameters)]
+        except Exception:
+            return None

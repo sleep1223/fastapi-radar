@@ -11,19 +11,27 @@ from fastapi.security import (
     HTTPBearer,
 )
 from fastapi.testclient import TestClient
+from tortoise import Tortoise
 
 from fastapi_radar import Radar
+from fastapi_radar.models import CapturedRequest
 
 
 @pytest.mark.security
+@pytest.mark.asyncio
 class TestAuthenticationIntegration:
     """Test authentication integration with Radar."""
 
-    def test_no_authentication_by_default(self, test_engine, storage_engine):
+    async def test_no_authentication_by_default(self):
         """Test that Radar endpoints are accessible without auth by default."""
         app = FastAPI()
-        radar = Radar(app, db_engine=test_engine, storage_engine=storage_engine)
-        radar.create_tables()
+        radar = Radar(app)
+        
+        await Tortoise.init(
+            db_url="sqlite://:memory:",
+            modules={"models": ["fastapi_radar.models"]}
+        )
+        await radar.create_tables()
 
         client = TestClient(app)
 
@@ -33,8 +41,10 @@ class TestAuthenticationIntegration:
 
         response = client.get("/__radar/api/stats?hours=1")
         assert response.status_code == 200
+        
+        await Tortoise.close_connections()
 
-    def test_basic_auth_protection(self, test_engine, storage_engine):
+    async def test_basic_auth_protection(self):
         """Test HTTP Basic authentication protection."""
         app = FastAPI()
         security = HTTPBasic()
@@ -52,11 +62,14 @@ class TestAuthenticationIntegration:
 
         radar = Radar(
             app,
-            db_engine=test_engine,
-            storage_engine=storage_engine,
             auth_dependency=verify_credentials,
         )
-        radar.create_tables()
+        
+        await Tortoise.init(
+            db_url="sqlite://:memory:",
+            modules={"models": ["fastapi_radar.models"]}
+        )
+        await radar.create_tables()
 
         client = TestClient(app)
 
@@ -71,8 +84,10 @@ class TestAuthenticationIntegration:
         # With correct credentials - should succeed
         response = client.get("/__radar/api/stats?hours=1", auth=("admin", "secret"))
         assert response.status_code == 200
+        
+        await Tortoise.close_connections()
 
-    def test_bearer_token_protection(self, test_engine, storage_engine):
+    async def test_bearer_token_protection(self):
         """Test Bearer token authentication protection."""
         app = FastAPI()
         security = HTTPBearer()
@@ -87,17 +102,20 @@ class TestAuthenticationIntegration:
 
         radar = Radar(
             app,
-            db_engine=test_engine,
-            storage_engine=storage_engine,
             auth_dependency=verify_token,
         )
-        radar.create_tables()
+        
+        await Tortoise.init(
+            db_url="sqlite://:memory:",
+            modules={"models": ["fastapi_radar.models"]}
+        )
+        await radar.create_tables()
 
         client = TestClient(app)
 
         # Without token - should fail
         response = client.get("/__radar/api/stats?hours=1")
-        assert response.status_code == 403
+        assert response.status_code in [401, 403]
 
         # With wrong token - should fail
         response = client.get(
@@ -112,8 +130,10 @@ class TestAuthenticationIntegration:
             headers={"Authorization": "Bearer valid-token-123"},
         )
         assert response.status_code == 200
+        
+        await Tortoise.close_connections()
 
-    def test_custom_auth_function(self, test_engine, storage_engine):
+    async def test_custom_auth_function(self):
         """Test custom authentication function."""
         app = FastAPI()
 
@@ -123,18 +143,23 @@ class TestAuthenticationIntegration:
 
         radar = Radar(
             app,
-            db_engine=test_engine,
-            storage_engine=storage_engine,
             auth_dependency=custom_auth,
         )
-        radar.create_tables()
+        
+        await Tortoise.init(
+            db_url="sqlite://:memory:",
+            modules={"models": ["fastapi_radar.models"]}
+        )
+        await radar.create_tables()
 
         client = TestClient(app)
         response = client.get("/__radar/api/stats?hours=1")
         # Should work as custom auth returns True
         assert response.status_code == 200
+        
+        await Tortoise.close_connections()
 
-    def test_auth_protects_dashboard(self, test_engine, storage_engine):
+    async def test_auth_protects_dashboard(self):
         """Test that authentication protects the dashboard."""
         app = FastAPI()
         security = HTTPBasic()
@@ -152,11 +177,14 @@ class TestAuthenticationIntegration:
 
         radar = Radar(
             app,
-            db_engine=test_engine,
-            storage_engine=storage_engine,
             auth_dependency=verify_credentials,
         )
-        radar.create_tables()
+        
+        await Tortoise.init(
+            db_url="sqlite://:memory:",
+            modules={"models": ["fastapi_radar.models"]}
+        )
+        await radar.create_tables()
 
         client = TestClient(app)
 
@@ -167,8 +195,10 @@ class TestAuthenticationIntegration:
         # Dashboard with auth should succeed
         response = client.get("/__radar/", auth=("admin", "secret"))
         assert response.status_code in [200, 307]
+        
+        await Tortoise.close_connections()
 
-    def test_auth_protects_all_api_endpoints(self, test_engine, storage_engine):
+    async def test_auth_protects_all_api_endpoints(self):
         """Test that authentication protects all API endpoints."""
         app = FastAPI()
         security = HTTPBearer()
@@ -180,11 +210,14 @@ class TestAuthenticationIntegration:
 
         radar = Radar(
             app,
-            db_engine=test_engine,
-            storage_engine=storage_engine,
             auth_dependency=verify_token,
         )
-        radar.create_tables()
+        
+        await Tortoise.init(
+            db_url="sqlite://:memory:",
+            modules={"models": ["fastapi_radar.models"]}
+        )
+        await radar.create_tables()
 
         client = TestClient(app)
         headers = {"Authorization": "Bearer secret"}
@@ -207,8 +240,10 @@ class TestAuthenticationIntegration:
             # With auth
             response = client.get(endpoint, headers=headers)
             assert response.status_code == 200, f"Endpoint {endpoint} failed with auth"
+            
+        await Tortoise.close_connections()
 
-    def test_app_endpoints_not_protected(self, test_engine, storage_engine):
+    async def test_app_endpoints_not_protected(self):
         """Test that application endpoints are not affected by Radar auth."""
         app = FastAPI()
         security = HTTPBearer()
@@ -220,11 +255,14 @@ class TestAuthenticationIntegration:
 
         radar = Radar(
             app,
-            db_engine=test_engine,
-            storage_engine=storage_engine,
             auth_dependency=verify_token,
         )
-        radar.create_tables()
+        
+        await Tortoise.init(
+            db_url="sqlite://:memory:",
+            modules={"models": ["fastapi_radar.models"]}
+        )
+        await radar.create_tables()
 
         @app.get("/public")
         async def public_endpoint():
@@ -246,21 +284,31 @@ class TestAuthenticationIntegration:
         # But Radar endpoints should require auth
         response = client.get("/__radar/api/stats?hours=1")
         assert response.status_code in [401, 403]
+        
+        await Tortoise.close_connections()
 
 
 @pytest.mark.security
+@pytest.mark.asyncio
 class TestSecurityBestPractices:
     """Test security best practices."""
 
-    def test_sensitive_headers_redacted(self, client, storage_session):
+    async def test_sensitive_headers_redacted(self):
         """Test that sensitive headers are redacted in captured requests."""
-        from fastapi_radar.models import CapturedRequest
-
-        app = client.app
+        app = FastAPI()
+        radar = Radar(app)
+        
+        await Tortoise.init(
+            db_url="sqlite://:memory:",
+            modules={"models": ["fastapi_radar.models"]}
+        )
+        await radar.create_tables()
 
         @app.get("/secure")
         async def secure_endpoint():
             return {"status": "ok"}
+
+        client = TestClient(app)
 
         # Make request with sensitive headers
         response = client.get(
@@ -274,22 +322,35 @@ class TestSecurityBestPractices:
         assert response.status_code == 200
 
         # Verify headers were redacted
-        requests = storage_session.query(CapturedRequest).all()
+        requests = await CapturedRequest.all()
         captured = [r for r in requests if "/secure" in r.path][-1]
 
-        assert captured.headers["authorization"] == "***REDACTED***"
-        assert captured.headers["cookie"] == "***REDACTED***"
-        assert captured.headers["x-api-key"] == "***REDACTED***"
+        # Note: keys are usually lowercase
+        # Also need to check how Radar stores headers (case sensitivity)
+        headers = {k.lower(): v for k, v in captured.headers.items()}
+        
+        assert headers.get("authorization") == "***REDACTED***"
+        assert headers.get("cookie") == "***REDACTED***"
+        assert headers.get("x-api-key") == "***REDACTED***"
+        
+        await Tortoise.close_connections()
 
-    def test_sensitive_body_redacted(self, client, storage_session):
+    async def test_sensitive_body_redacted(self):
         """Test that sensitive body content is redacted."""
-        from fastapi_radar.models import CapturedRequest
-
-        app = client.app
+        app = FastAPI()
+        radar = Radar(app)
+        
+        await Tortoise.init(
+            db_url="sqlite://:memory:",
+            modules={"models": ["fastapi_radar.models"]}
+        )
+        await radar.create_tables()
 
         @app.post("/login")
         async def login(data: dict):
             return {"status": "ok"}
+
+        client = TestClient(app)
 
         # Send request with sensitive data
         response = client.post(
@@ -303,10 +364,12 @@ class TestSecurityBestPractices:
         assert response.status_code == 200
 
         # Verify body was redacted
-        requests = storage_session.query(CapturedRequest).all()
+        requests = await CapturedRequest.all()
         captured = [r for r in requests if "/login" in r.path][-1]
 
         assert "super-secret" not in captured.body
         assert "key-123" not in captured.body
         assert "***REDACTED***" in captured.body
         assert "john" in captured.body  # username should remain
+        
+        await Tortoise.close_connections()

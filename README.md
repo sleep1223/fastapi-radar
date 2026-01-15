@@ -1,272 +1,90 @@
-# FastAPI Radar
+<div align="center">
+	<img src="./public/favicon.svg" width="160" />
+	<h1>FastAPI Radar（Tortoise ORM 适配版）</h1>
+  <span>中文 | <a href="./README.en_US.md">English</a></span>
+</div>
 
-[![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**A debugging dashboard for FastAPI applications providing real-time request, database query, and exception monitoring.**
+本仓库是 fastapi-radar 的 Tortoise ORM 适配版
 
-**Just one line to add powerful monitoring to your FastAPI app!**
+默认访问地址：http://localhost:8000/__radar
 
-## See it in Action
+## 安装
 
-![FastAPI Radar Dashboard Demo](./assets/demo.gif)
-
-## Installation
-
-```bash
-pip install fastapi-radar
-```
-
-Or with your favorite package manager:
+Install from GitHub repository:
 
 ```bash
-# Using poetry
-poetry add fastapi-radar
-
-# Using pipenv
-pipenv install fastapi-radar
+pip install git+https://github.com/sleep1223/fastapi-radar.git
 ```
 
-**Note:** The dashboard comes pre-built! No need to build anything - just install and use.
+Install with uv:
 
-## Quick Start
+```bash
+uv add git+https://github.com/sleep1223/fastapi-radar.git
+```
 
-### With SQL Database (Full Monitoring)
+```bash
+uv run pip install git+https://github.com/sleep1223/fastapi-radar.git
+```
+
+Install from local source:
+
+```bash
+uv run pip install .
+```
+
+Dev install:
+
+```bash
+uv run pip install -e ".[dev]"
+
+## 使用
+
+最小可用示例（集成 Tortoise ORM）：
 
 ```python
 from fastapi import FastAPI
 from fastapi_radar import Radar
-from sqlalchemy import create_engine
-
-app = FastAPI()
-engine = create_engine("sqlite:///./app.db")
-
-# Full monitoring with SQL query tracking
-radar = Radar(app, db_engine=engine)
-radar.create_tables()
-
-# Your routes work unchanged
-@app.get("/users")
-async def get_users():
-    return {"users": []}
-```
-
-### Without SQL Database (HTTP & Exception Monitoring)
-
-```python
-from fastapi import FastAPI
-from fastapi_radar import Radar
+from tortoise.contrib.fastapi import register_tortoise
 
 app = FastAPI()
 
-# Monitor HTTP requests and exceptions only
-# Perfect for NoSQL databases, external APIs, or database-less apps
-radar = Radar(app)  # No db_engine parameter needed!
-radar.create_tables()
-
-@app.get("/api/data")
-async def get_data():
-    # Your MongoDB, Redis, or external API calls here
-    return {"data": []}
-```
-
-Access your dashboard at: **http://localhost:8000/\_\_radar/**
-
-## Features
-
-- **Zero Configuration** - Works with any FastAPI app (SQL database optional)
-- **Request Monitoring** - Complete HTTP request/response capture with timing
-- **Database Monitoring** - SQL query logging with execution times (when using SQLAlchemy)
-- **Exception Tracking** - Automatic exception capture with stack traces
-- **Real-time Updates** - Live dashboard updates as requests happen
-- **Flexible Integration** - Use with SQL, NoSQL, or no database at all
-
-## Configuration
-
-```python
-radar = Radar(
-    app,
-    db_engine=engine,            # Optional: SQLAlchemy engine for SQL query monitoring
-    dashboard_path="/__radar",   # Custom dashboard path (default: "/__radar")
-    max_requests=1000,           # Max requests to store (default: 1000)
-    retention_hours=24,          # Data retention period (default: 24)
-    slow_query_threshold=100,    # Mark queries slower than this as slow (ms)
-    capture_sql_bindings=True,   # Capture SQL query parameters
-    exclude_paths=["/health"],   # Paths to exclude from monitoring
-    theme="auto",                # Dashboard theme: "light", "dark", or "auto"
-    db_path="/path/to/db",       # Custom path for radar.duckdb file (default: current directory)
-    auth_dependency=None,        # Optional: Authentication dependency for dashboard and API access
-)
-```
-
-## Securing the Dashboard
-
-By default, FastAPI Radar is accessible without authentication. For production environments, you should add authentication to protect your monitoring dashboard:
-
-### HTTP Basic Authentication
-
-```python
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi_radar import Radar
-import secrets
-
-app = FastAPI()
-security = HTTPBasic()
-
-def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
-    correct_username = secrets.compare_digest(credentials.username, "admin")
-    correct_password = secrets.compare_digest(credentials.password, "secret")
-    if not (correct_username and correct_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return credentials
-
-radar = Radar(app, auth_dependency=verify_credentials)
-radar.create_tables()
-```
-
-### Bearer Token Authentication
-
-```python
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi_radar import Radar
-
-app = FastAPI()
-security = HTTPBearer()
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != "your-secret-token":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
-        )
-    return credentials
-
-radar = Radar(app, auth_dependency=verify_token)
-radar.create_tables()
-```
-
-### Custom Authentication
-
-You can use any FastAPI dependency for authentication:
-
-```python
-from fastapi import FastAPI, Depends, HTTPException, Request
-from fastapi_radar import Radar
-
-app = FastAPI()
-
-async def custom_auth(request: Request):
-    # Your custom authentication logic
-    api_key = request.headers.get("X-API-Key")
-    if api_key != "your-api-key":
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return True
-
-radar = Radar(app, auth_dependency=custom_auth)
-radar.create_tables()
-```
-
-The `auth_dependency` parameter accepts any FastAPI dependency function, giving you full flexibility to implement OAuth2, JWT, API keys, or any other authentication mechanism.
-
-### Custom Database Location
-
-By default, FastAPI Radar stores its monitoring data in a `radar.duckdb` file in your current working directory. You can customize this location using the `db_path` parameter:
-
-```python
-# Store in a specific directory
-radar = Radar(app, db_path="/var/data/monitoring")
-# Creates: /var/data/monitoring/radar.duckdb
-
-# Store with a specific filename
-radar = Radar(app, db_path="/var/data/my_app_monitoring.duckdb")
-# Creates: /var/data/my_app_monitoring.duckdb
-
-# Use a relative path
-radar = Radar(app, db_path="./data")
-# Creates: ./data/radar.duckdb
-```
-
-If the specified path cannot be created, FastAPI Radar will fallback to using the current directory with a warning.
-
-### Development Mode with Auto-Reload
-
-When running your FastAPI application with `fastapi dev` (which uses auto-reload), FastAPI Radar automatically switches to an in-memory database to avoid file locking issues. This means:
-
-- **No file locking errors** - The dashboard will work seamlessly in development
-- **Data doesn't persist between reloads** - Each reload starts with a fresh database
-- **Production behavior unchanged** - When using `fastapi run` or deploying, the normal file-based database is used
-
-```python
-# With fastapi dev (auto-reload enabled):
-# Automatically uses in-memory database - no configuration needed!
 radar = Radar(app)
-radar.create_tables()  # Safe to call - handles multiple processes gracefully
+
+register_tortoise(
+    app,
+    db_url="sqlite://example.db",
+    modules={"models": ["your_app.models", "fastapi_radar.models"]},
+    generate_schemas=True,
+    add_exception_handlers=True,
+)
+
+@app.get("/")
+async def index():
+    return {"message": "ok"}
 ```
 
-This behavior only applies when using the development server with auto-reload (`fastapi dev`). In production or when using `fastapi run`, the standard file-based DuckDB storage is used.
+启动应用后，访问：
+- API: http://localhost:8000
+- 文档: http://localhost:8000/docs
+- 调试面板: http://localhost:8000/__radar
 
-## What Gets Captured?
+## 运行测试
 
-- ✅ HTTP requests and responses
-- ✅ Response times and performance metrics
-- ✅ SQL queries with execution times
-- ✅ Query parameters and bindings
-- ✅ Slow query detection
-- ✅ Exceptions with stack traces
-- ✅ Request/response bodies and headers
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-### Development Setup
-
-For contributors who want to modify the codebase:
-
-1. Clone the repository:
+1. 安装开发依赖：
 
 ```bash
-git clone https://github.com/doganarif/fastapi-radar.git
-cd fastapi-radar
+uv add pytest
 ```
 
-2. Install development dependencies:
+2. 在项目根目录运行全部测试：
 
 ```bash
-pip install -e ".[dev]"
+uv run pytest
 ```
 
-3. (Optional) If modifying the dashboard UI:
+3. 如果只想运行标记为集成测试的用例：
 
 ```bash
-cd fastapi_radar/dashboard
-npm install
-npm run dev  # For development with hot reload
-# or
-npm run build  # To rebuild the production bundle
+uv run pytest -m integration
 ```
-
-4. Run the example apps:
-
-```bash
-# Example with SQL database
-python example_app.py
-
-# Example without SQL database (NoSQL/in-memory)
-python example_nosql_app.py
-```
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Built with [FastAPI](https://fastapi.tiangolo.com/)
-- Dashboard powered by [React](https://react.dev/) and [shadcn/ui](https://ui.shadcn.com/)

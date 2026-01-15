@@ -3,8 +3,6 @@
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy.exc import IntegrityError
-
 from fastapi_radar.models import (
     BackgroundTask,
     CapturedException,
@@ -15,16 +13,17 @@ from fastapi_radar.models import (
     Trace,
 )
 
+from tortoise.exceptions import IntegrityError
+
 
 @pytest.mark.unit
+@pytest.mark.asyncio
 class TestCapturedRequest:
     """Test CapturedRequest model."""
 
-    def test_create_captured_request(self, test_session, sample_request_data):
+    async def test_create_captured_request(self, db, sample_request_data):
         """Test creating a captured request."""
-        request = CapturedRequest(**sample_request_data)
-        test_session.add(request)
-        test_session.commit()
+        request = await CapturedRequest.create(**sample_request_data)
 
         assert request.id is not None
         assert request.request_id == "test-request-123"
@@ -33,114 +32,110 @@ class TestCapturedRequest:
         assert request.status_code == 200
         assert request.created_at is not None
 
-    def test_request_id_unique(self, test_session, sample_request_data):
+    async def test_request_id_unique(self, db, sample_request_data):
         """Test that request_id must be unique."""
-        request1 = CapturedRequest(**sample_request_data)
-        test_session.add(request1)
-        test_session.commit()
-
-        request2 = CapturedRequest(**sample_request_data)
-        test_session.add(request2)
+        await CapturedRequest.create(**sample_request_data)
 
         with pytest.raises(IntegrityError):
-            test_session.commit()
+            await CapturedRequest.create(**sample_request_data)
 
-    def test_request_with_queries(self, test_session, sample_request_data, sample_query_data):
+    async def test_request_with_queries(self, db, sample_request_data, sample_query_data):
         """Test request with associated queries."""
-        request = CapturedRequest(**sample_request_data)
-        test_session.add(request)
-        test_session.commit()
+        request = await CapturedRequest.create(**sample_request_data)
 
-        query = CapturedQuery(**sample_query_data)
-        test_session.add(query)
-        test_session.commit()
+        # Create query linked to request
+        # Tortoise FK can be set by object instance
+        query_data = sample_query_data.copy()
+        query_data["request"] = request
+        await CapturedQuery.create(**query_data)
 
-        test_session.refresh(request)
-        assert len(request.queries) == 1
-        assert request.queries[0].sql == sample_query_data["sql"]
+        # Verify relation
+        queries = await request.queries.all()
+        assert len(queries) == 1
+        assert queries[0].sql == sample_query_data["sql"]
 
-    def test_request_with_exceptions(
-        self, test_session, sample_request_data, sample_exception_data
-    ):
+    async def test_request_with_exceptions(self, db, sample_request_data, sample_exception_data):
         """Test request with associated exceptions."""
-        request = CapturedRequest(**sample_request_data)
-        test_session.add(request)
-        test_session.commit()
+        request = await CapturedRequest.create(**sample_request_data)
 
-        exception = CapturedException(**sample_exception_data)
-        test_session.add(exception)
-        test_session.commit()
+        exc_data = sample_exception_data.copy()
+        exc_data["request"] = request
+        await CapturedException.create(**exc_data)
 
-        test_session.refresh(request)
-        assert len(request.exceptions) == 1
-        assert request.exceptions[0].exception_type == "ValueError"
+        exceptions = await request.exceptions.all()
+        assert len(exceptions) == 1
+        assert exceptions[0].exception_type == "ValueError"
 
-    def test_cascade_delete(self, test_session, sample_request_data, sample_query_data):
+    async def test_cascade_delete(self, db, sample_request_data, sample_query_data):
         """Test that deleting request cascades to queries and exceptions."""
-        request = CapturedRequest(**sample_request_data)
-        test_session.add(request)
-        test_session.commit()
+        request = await CapturedRequest.create(**sample_request_data)
 
-        query = CapturedQuery(**sample_query_data)
-        test_session.add(query)
-        test_session.commit()
+        query_data = sample_query_data.copy()
+        query_data["request"] = request
+        await CapturedQuery.create(**query_data)
 
-        test_session.delete(request)
-        test_session.commit()
+        await request.delete()
 
-        assert test_session.query(CapturedQuery).count() == 0
+        count = await CapturedQuery.all().count()
+        assert count == 0
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
 class TestCapturedQuery:
     """Test CapturedQuery model."""
 
-    def test_create_captured_query(self, test_session, sample_query_data):
+    async def test_create_captured_query(self, db, sample_query_data, sample_request_data):
         """Test creating a captured query."""
-        query = CapturedQuery(**sample_query_data)
-        test_session.add(query)
-        test_session.commit()
+        # Must create request first
+        request = await CapturedRequest.create(**sample_request_data)
+
+        query_data = sample_query_data.copy()
+        query_data["request"] = request
+        query = await CapturedQuery.create(**query_data)
 
         assert query.id is not None
         assert query.request_id == "test-request-123"
         assert query.sql == sample_query_data["sql"]
         assert query.duration_ms == 12.34
 
-    def test_query_with_parameters(self, test_session):
+    async def test_query_with_parameters(self, db, sample_request_data):
         """Test query with different parameter types."""
+        # Create request first
+        request = await CapturedRequest.create(**sample_request_data)
+
         # List parameters
-        query1 = CapturedQuery(
-            request_id="test-1",
+        query1 = await CapturedQuery.create(
+            request=request,
             sql="SELECT * FROM users WHERE id = ?",
             parameters=["1", "2"],
             duration_ms=10.0,
         )
-        test_session.add(query1)
 
         # Dict parameters
-        query2 = CapturedQuery(
-            request_id="test-2",
+        query2 = await CapturedQuery.create(
+            request=request,
             sql="SELECT * FROM users WHERE id = :id",
             parameters={"id": "1"},
             duration_ms=10.0,
         )
-        test_session.add(query2)
-
-        test_session.commit()
 
         assert isinstance(query1.parameters, list)
         assert isinstance(query2.parameters, dict)
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
 class TestCapturedException:
     """Test CapturedException model."""
 
-    def test_create_captured_exception(self, test_session, sample_exception_data):
+    async def test_create_captured_exception(self, db, sample_exception_data, sample_request_data):
         """Test creating a captured exception."""
-        exception = CapturedException(**sample_exception_data)
-        test_session.add(exception)
-        test_session.commit()
+        request = await CapturedRequest.create(**sample_request_data)
+
+        exc_data = sample_exception_data.copy()
+        exc_data["request"] = request
+        exception = await CapturedException.create(**exc_data)
 
         assert exception.id is not None
         assert exception.request_id == "test-request-123"
@@ -149,12 +144,13 @@ class TestCapturedException:
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
 class TestTrace:
     """Test Trace model."""
 
-    def test_create_trace(self, test_session):
+    async def test_create_trace(self, db):
         """Test creating a trace."""
-        trace = Trace(
+        trace = await Trace.create(
             trace_id="abc123",
             service_name="test-service",
             operation_name="GET /users",
@@ -162,149 +158,141 @@ class TestTrace:
             span_count=3,
             status="ok",
         )
-        test_session.add(trace)
-        test_session.commit()
 
         assert trace.trace_id == "abc123"
         assert trace.service_name == "test-service"
         assert trace.span_count == 3
 
-    def test_trace_with_spans(self, test_session):
+    async def test_trace_with_spans(self, db):
         """Test trace with associated spans."""
-        trace = Trace(
+        trace = await Trace.create(
             trace_id="trace-123",
             service_name="test-service",
             operation_name="GET /users",
             start_time=datetime.now(timezone.utc),
         )
-        test_session.add(trace)
-        test_session.commit()
 
-        span = Span(
+        await Span.create(
             span_id="span-123",
-            trace_id="trace-123",
+            trace=trace,
             operation_name="db.query",
             service_name="test-service",
             start_time=datetime.now(timezone.utc),
         )
-        test_session.add(span)
-        test_session.commit()
 
-        test_session.refresh(trace)
-        assert len(trace.spans) == 1
+        spans = await trace.spans.all()
+        assert len(spans) == 1
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
 class TestSpan:
     """Test Span model."""
 
-    def test_create_span(self, test_session):
+    async def test_create_span(self, db):
         """Test creating a span."""
-        span = Span(
+        # Span needs a trace FK
+        trace = await Trace.create(trace_id="trace-123", start_time=datetime.now(timezone.utc))
+
+        span = await Span.create(
             span_id="span-123",
-            trace_id="trace-123",
+            trace=trace,
             operation_name="db.query",
             service_name="test-service",
             start_time=datetime.now(timezone.utc),
             span_kind="client",
         )
-        test_session.add(span)
-        test_session.commit()
 
         assert span.span_id == "span-123"
         assert span.trace_id == "trace-123"
         assert span.span_kind == "client"
 
-    def test_span_with_tags_and_logs(self, test_session):
+    async def test_span_with_tags_and_logs(self, db):
         """Test span with tags and logs."""
-        span = Span(
+        trace = await Trace.create(trace_id="trace-123", start_time=datetime.now(timezone.utc))
+
+        span = await Span.create(
             span_id="span-456",
-            trace_id="trace-123",
+            trace=trace,
             operation_name="db.query",
             service_name="test-service",
             start_time=datetime.now(timezone.utc),
             tags={"db.statement": "SELECT * FROM users", "db.system": "postgresql"},
             logs=[{"timestamp": "2024-01-01T00:00:00", "message": "Query started"}],
         )
-        test_session.add(span)
-        test_session.commit()
 
         assert "db.statement" in span.tags
         assert len(span.logs) == 1
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
 class TestSpanRelation:
     """Test SpanRelation model."""
 
-    def test_create_span_relation(self, test_session):
+    async def test_create_span_relation(self, db):
         """Test creating a span relation."""
-        relation = SpanRelation(
+        relation = await SpanRelation.create(
             trace_id="trace-123",
             parent_span_id="span-parent",
             child_span_id="span-child",
             depth=1,
         )
-        test_session.add(relation)
-        test_session.commit()
 
         assert relation.trace_id == "trace-123"
         assert relation.depth == 1
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
 class TestBackgroundTask:
     """Test BackgroundTask model."""
 
-    def test_create_background_task(self, test_session):
+    async def test_create_background_task(self, db):
         """Test creating a background task."""
-        task = BackgroundTask(
+        task = await BackgroundTask.create(
             task_id="task-123",
             request_id="request-123",
             name="send_email",
             status="pending",
             start_time=datetime.now(timezone.utc),
         )
-        test_session.add(task)
-        test_session.commit()
 
         assert task.task_id == "task-123"
         assert task.name == "send_email"
         assert task.status == "pending"
 
-    def test_background_task_completion(self, test_session):
+    async def test_background_task_completion(self, db):
         """Test completing a background task."""
+        from datetime import timedelta
+
         start_time = datetime.now(timezone.utc)
-        task = BackgroundTask(
+        task = await BackgroundTask.create(
             task_id="task-456",
             name="process_data",
             status="running",
             start_time=start_time,
         )
-        test_session.add(task)
-        test_session.commit()
 
         # Complete the task
         task.status = "completed"
-        task.end_time = datetime.now(timezone.utc)
+        task.end_time = start_time + timedelta(milliseconds=150)
         task.duration_ms = 150.5
-        test_session.commit()
+        await task.save()
 
         assert task.status == "completed"
         assert task.duration_ms == 150.5
         assert task.end_time > task.start_time
 
-    def test_background_task_failure(self, test_session):
+    async def test_background_task_failure(self, db):
         """Test failed background task."""
-        task = BackgroundTask(
+        task = await BackgroundTask.create(
             task_id="task-789",
             name="failing_task",
             status="failed",
             start_time=datetime.now(timezone.utc),
             error="Task failed due to network error",
         )
-        test_session.add(task)
-        test_session.commit()
 
         assert task.status == "failed"
         assert task.error is not None

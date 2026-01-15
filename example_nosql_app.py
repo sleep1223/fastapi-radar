@@ -1,11 +1,13 @@
 """Example FastAPI application with Radar integration (No SQL/ORM)."""
 
-from typing import List, Optional
 from datetime import datetime
+from typing import List, Optional
+
 from fastapi import FastAPI, HTTPException, Query
+from fastapi_radar import Radar
 from pydantic import BaseModel
 
-from fastapi_radar import Radar
+from tortoise.contrib.fastapi import register_tortoise
 
 # In-memory data store (simulates NoSQL/MongoDB/Redis)
 products_db = {}
@@ -59,7 +61,15 @@ radar = Radar(
     dashboard_path="/__radar",
     theme="auto",
 )
-radar.create_tables()
+
+# Initialize Tortoise for Radar
+register_tortoise(
+    app,
+    db_url="sqlite://nosql_app.db",
+    modules={"models": ["fastapi_radar.models"]},
+    generate_schemas=True,
+    add_exception_handlers=True,
+)
 
 # Routes
 
@@ -199,54 +209,50 @@ if __name__ == "__main__":
     import uvicorn
 
     # Add sample data
-    products_db.update(
-        {
-            1: {
-                "id": 1,
-                "name": "Laptop",
-                "description": "High-performance laptop",
-                "price": 999.99,
-                "in_stock": True,
-                "created_at": datetime.utcnow(),
-            },
-            2: {
-                "id": 2,
-                "name": "Mouse",
-                "description": "Wireless mouse",
-                "price": 29.99,
-                "in_stock": True,
-                "created_at": datetime.utcnow(),
-            },
-            3: {
-                "id": 3,
-                "name": "Keyboard",
-                "description": "Mechanical keyboard",
-                "price": 149.99,
-                "in_stock": False,
-                "created_at": datetime.utcnow(),
-            },
-        }
-    )
+    products_db.update({
+        1: {
+            "id": 1,
+            "name": "Laptop",
+            "description": "High-performance laptop",
+            "price": 999.99,
+            "in_stock": True,
+            "created_at": datetime.utcnow(),
+        },
+        2: {
+            "id": 2,
+            "name": "Mouse",
+            "description": "Wireless mouse",
+            "price": 29.99,
+            "in_stock": True,
+            "created_at": datetime.utcnow(),
+        },
+        3: {
+            "id": 3,
+            "name": "Keyboard",
+            "description": "Mechanical keyboard",
+            "price": 149.99,
+            "in_stock": False,
+            "created_at": datetime.utcnow(),
+        },
+    })
     next_product_id = 4
 
-    users_db.update(
-        {
-            1: {
-                "id": 1,
-                "username": "johndoe",
-                "email": "john@example.com",
-                "full_name": "John Doe",
-                "created_at": datetime.utcnow(),
-            },
-            2: {
-                "id": 2,
-                "username": "janedoe",
-                "email": "jane@example.com",
-                "full_name": "Jane Doe",
-                "created_at": datetime.utcnow(),
-            },
-        }
-    )
+    users_db.update({
+        1: {
+            "id": 1,
+            "username": "johndoe",
+            "email": "john@example.com",
+            "full_name": "John Doe",
+            "created_at": datetime.utcnow(),
+        },
+        2: {
+            "id": 2,
+            "username": "janedoe",
+            "email": "jane@example.com",
+            "full_name": "Jane Doe",
+            "created_at": datetime.utcnow(),
+        },
+    })
     next_user_id = 3
 
     print("\n" + "=" * 60)

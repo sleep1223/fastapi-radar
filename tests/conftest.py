@@ -1,137 +1,68 @@
 """Shared test fixtures for FastAPI Radar tests."""
 
-import tempfile
-from contextlib import contextmanager
-from typing import Generator
-from unittest.mock import MagicMock
-
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
-
 from fastapi_radar import Radar
-from fastapi_radar.models import Base
+
+from tortoise import Tortoise
 
 
 @pytest.fixture(scope="function")
-def temp_db():
-    """Create a temporary SQLite database for tests."""
-    temp_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    temp_file.close()
-    yield temp_file.name
-
-
-@pytest.fixture(scope="function")
-def test_engine():
-    """Create an in-memory SQLite engine for testing."""
-    engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    Base.metadata.create_all(bind=engine)
-    yield engine
-    Base.metadata.drop_all(bind=engine)
-    engine.dispose()
-
-
-@pytest.fixture(scope="function")
-def storage_engine():
-    """Create a separate in-memory storage engine for Radar data."""
-    engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    Base.metadata.create_all(bind=engine)
-    yield engine
-    Base.metadata.drop_all(bind=engine)
-    engine.dispose()
-
-
-@pytest.fixture(scope="function")
-def test_session(test_engine) -> Generator[Session, None, None]:
-    """Create a test database session."""
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    session = SessionLocal()
-    try:
-        yield session
-    finally:
-        session.close()
-
-
-@pytest.fixture(scope="function")
-def storage_session(storage_engine) -> Generator[Session, None, None]:
-    """Create a storage session for Radar data."""
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=storage_engine)
-    session = SessionLocal()
-    try:
-        yield session
-    finally:
-        session.close()
-
-
-@pytest.fixture(scope="function")
-def app():
+async def app():
     """Create a test FastAPI application."""
     return FastAPI(title="Test App")
 
 
 @pytest.fixture(scope="function")
-def radar_app(app, test_engine, storage_engine):
+async def radar_app(app):
     """Create a FastAPI app with Radar configured."""
+    # Initialize Radar
     radar = Radar(
         app,
-        db_engine=test_engine,
-        storage_engine=storage_engine,
         dashboard_path="/__radar",
         max_requests=100,
         retention_hours=24,
         slow_query_threshold=100,
     )
-    radar.create_tables()
-    return app, radar
+
+    # Initialize Tortoise for testing
+    await Tortoise.init(
+        db_url="sqlite://:memory:",
+        modules={"models": ["fastapi_radar.models"]},
+    )
+    await Tortoise.generate_schemas()
+
+    yield app, radar
+
+    await Tortoise.close_connections()
 
 
 @pytest.fixture(scope="function")
-def client(radar_app):
+async def client(radar_app):
     """Create a test client for the Radar-enabled app."""
     app, radar = radar_app
-    return TestClient(app)
+    # TestClient is synchronous, but we need it for testing endpoints.
+    # For async tests, we might want to use AsyncClient, but keeping TestClient for now
+    # as it's standard for FastAPI tests unless we specifically need async client features.
+    # However, since we are using Tortoise (async), we might need to handle async context.
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture(scope="function")
+async def db():
+    """Initialize Tortoise DB for unit tests."""
+    await Tortoise.init(db_url="sqlite://:memory:", modules={"models": ["fastapi_radar.models"]})
+    await Tortoise.generate_schemas()
+    yield
+    await Tortoise.close_connections()
 
 
 @pytest.fixture(scope="function")
 def simple_app():
     """Create a simple FastAPI app without Radar for isolated testing."""
     return FastAPI(title="Simple Test App")
-
-
-@pytest.fixture(scope="function")
-def mock_session():
-    """Create a mock database session."""
-    session = MagicMock(spec=Session)
-    session.add = MagicMock()
-    session.commit = MagicMock()
-    session.query = MagicMock()
-    session.close = MagicMock()
-    return session
-
-
-@pytest.fixture(scope="function")
-def mock_get_session(storage_session):
-    """Create a mock get_session context manager."""
-
-    @contextmanager
-    def get_session():
-        try:
-            yield storage_session
-        finally:
-            pass
-
-    return get_session
 
 
 @pytest.fixture

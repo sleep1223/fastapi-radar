@@ -7,8 +7,8 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import case, desc, func
-from sqlalchemy.orm import Session
+
+from tortoise.functions import Avg, Count
 
 from .models import (
     BackgroundTask,
@@ -61,7 +61,7 @@ class RequestDetail(BaseModel):
 
 class QueryDetail(BaseModel):
     id: int
-    request_id: str
+    request_id: Optional[str]
     sql: str
     parameters: Union[Dict[str, str], List[str], None]
     duration_ms: Optional[float]
@@ -72,7 +72,7 @@ class QueryDetail(BaseModel):
 
 class ExceptionDetail(BaseModel):
     id: int
-    request_id: str
+    request_id: Optional[str]
     exception_type: str
     exception_value: Optional[str]
     traceback: str
@@ -142,18 +142,13 @@ class TraceDetail(BaseModel):
     spans: List[WaterfallSpan]
 
 
-def create_api_router(get_session_context, auth_dependency: Optional[Callable] = None) -> APIRouter:
+def create_api_router(auth_dependency: Optional[Callable] = None) -> APIRouter:
     # Build dependencies list for the router
     dependencies = []
     if auth_dependency:
         dependencies.append(Depends(auth_dependency))
 
     router = APIRouter(prefix="/__radar/api", tags=["radar"], dependencies=dependencies)
-
-    def get_db():
-        """Dependency function for FastAPI to get database session."""
-        with get_session_context() as session:
-            yield session
 
     @router.get("/requests", response_model=List[RequestSummary])
     async def get_requests(
@@ -164,34 +159,31 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
         search: Optional[str] = None,
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
-        session: Session = Depends(get_db),
     ):
-        query = session.query(CapturedRequest)
+        query = CapturedRequest.all()
 
         if start_time:
-            query = query.filter(CapturedRequest.created_at >= start_time)
+            query = query.filter(created_at__gte=start_time)
         if end_time:
-            query = query.filter(CapturedRequest.created_at <= end_time)
+            query = query.filter(created_at__lte=end_time)
         if status_code:
             if status_code in [200, 300, 400, 500]:
                 # Filter by status code range
                 lower_bound = status_code
                 upper_bound = status_code + 100
                 query = query.filter(
-                    CapturedRequest.status_code >= lower_bound,
-                    CapturedRequest.status_code < upper_bound,
+                    status_code__gte=lower_bound,
+                    status_code__lt=upper_bound,
                 )
             else:
                 # Exact status code match
-                query = query.filter(CapturedRequest.status_code == status_code)
+                query = query.filter(status_code=status_code)
         if method:
-            query = query.filter(CapturedRequest.method == method)
+            query = query.filter(method=method)
         if search:
-            query = query.filter(CapturedRequest.path.ilike(f"%{search}%"))
+            query = query.filter(path__icontains=search)
 
-        requests = (
-            query.order_by(desc(CapturedRequest.created_at)).offset(offset).limit(limit).all()
-        )
+        requests = await query.order_by("-created_at").offset(offset).limit(limit).prefetch_related("queries", "exceptions")
 
         return [
             RequestSummary(
@@ -209,13 +201,30 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
         ]
 
     @router.get("/requests/{request_id}", response_model=RequestDetail)
-    async def get_request_detail(request_id: str, session: Session = Depends(get_db)):
-        request = (
-            session.query(CapturedRequest).filter(CapturedRequest.request_id == request_id).first()
-        )
+    async def get_request_detail(request_id: str):
+        request = await CapturedRequest.filter(request_id=request_id).first()
 
         if not request:
             raise HTTPException(status_code=404, detail="Request not found")
+
+        # Manually fetch related items if not prefetched (Tortoise lazy loading needs await)
+        # But we can query them separately or use fetch_related
+        # Or better, query CapturedQuery and CapturedException filtering by request_id
+        # Since we didn't use strict ForeignKeys in models for request_id (they are strings),
+        # we have to query manually.
+        # Wait, in models.py I used fields.ReverseRelation["CapturedQuery"].
+        # If I want to use that, I need to setup ForeignKey properly.
+        # But I said I kept it loose?
+        # Let's check models.py again.
+        # CapturedQuery has request_id field.
+        # CapturedRequest has queries: fields.ReverseRelation["CapturedQuery"]
+        # But for ReverseRelation to work, CapturedQuery must have a ForeignKey to CapturedRequest.
+        # In models.py I didn't add ForeignKey. I just added request_id CharField.
+        # So ReverseRelation won't work automatically.
+        # So I have to query manually.
+
+        queries = await CapturedQuery.filter(request_id=request_id).all()
+        exceptions = await CapturedException.filter(request_id=request_id).all()
 
         return RequestDetail(
             id=request.id,
@@ -240,9 +249,9 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
                     "duration_ms": round_float(q.duration_ms),
                     "rows_affected": q.rows_affected,
                     "connection_name": q.connection_name,
-                    "created_at": q.created_at.isoformat(),
+                    "created_at": q.created_at,
                 }
-                for q in request.queries
+                for q in queries
             ],
             exceptions=[
                 {
@@ -250,17 +259,15 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
                     "exception_type": e.exception_type,
                     "exception_value": e.exception_value,
                     "traceback": e.traceback,
-                    "created_at": e.created_at.isoformat(),
+                    "created_at": e.created_at,
                 }
-                for e in request.exceptions
+                for e in exceptions
             ],
         )
 
     @router.get("/requests/{request_id}/curl")
-    async def get_request_as_curl(request_id: str, session: Session = Depends(get_db)):
-        request = (
-            session.query(CapturedRequest).filter(CapturedRequest.request_id == request_id).first()
-        )
+    async def get_request_as_curl(request_id: str):
+        request = await CapturedRequest.filter(request_id=request_id).first()
 
         if not request:
             raise HTTPException(status_code=404, detail="Request not found")
@@ -288,31 +295,15 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
     async def replay_request(
         request_id: str,
         body: Optional[Dict[str, Any]] = None,
-        session: Session = Depends(get_db),
     ):
-        """Replay a captured request with optional body override.
-
-        WARNING: This endpoint replays HTTP requests. Use with caution in production.
-        Consider adding authentication and rate limiting.
-        """
-        request = (
-            session.query(CapturedRequest).filter(CapturedRequest.request_id == request_id).first()
-        )
+        """Replay a captured request with optional body override."""
+        request = await CapturedRequest.filter(request_id=request_id).first()
 
         if not request:
             raise HTTPException(status_code=404, detail="Request not found")
 
         # Security: Validate URL to prevent SSRF attacks
-        # Note: This is basic protection. For production, consider:
-        # 1. Whitelist allowed domains
-        # 2. Add authentication to this endpoint
-        # 3. Add rate limiting
-        # For dev/testing, allow localhost. For production, consider blocking.
-        # Example: Uncomment below to block all internal IPs:
-        # from urllib.parse import urlparse
-        # parsed = urlparse(request.url)
-        # if parsed.hostname in ["localhost", "127.0.0.1", "0.0.0.0", "::1", "::ffff:127.0.0.1"]:
-        #     raise HTTPException(status_code=403, detail="Replay to localhost is disabled")
+        # ...
 
         # Build replay request
         headers = dict(request.headers) if request.headers else {}
@@ -350,9 +341,7 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
                     duration_ms=response.elapsed.total_seconds() * 1000,
                     client_ip="replay",
                 )
-                session.add(replayed_request)
-                session.commit()
-                session.refresh(replayed_request)
+                await replayed_request.save()
 
                 return {
                     "status_code": response.status_code,
@@ -373,16 +362,15 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
         slow_only: bool = Query(False),
         slow_threshold: int = Query(100),
         search: Optional[str] = None,
-        session: Session = Depends(get_db),
     ):
-        query = session.query(CapturedQuery)
+        query = CapturedQuery.all()
 
         if slow_only:
-            query = query.filter(CapturedQuery.duration_ms >= slow_threshold)
+            query = query.filter(duration_ms__gte=slow_threshold)
         if search:
-            query = query.filter(CapturedQuery.sql.ilike(f"%{search}%"))
+            query = query.filter(sql__icontains=search)
 
-        queries = query.order_by(desc(CapturedQuery.created_at)).offset(offset).limit(limit).all()
+        queries = await query.order_by("-created_at").offset(offset).limit(limit)
 
         return [
             QueryDetail(
@@ -403,16 +391,13 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
         exception_type: Optional[str] = None,
-        session: Session = Depends(get_db),
     ):
-        query = session.query(CapturedException)
+        query = CapturedException.all()
 
         if exception_type:
-            query = query.filter(CapturedException.exception_type == exception_type)
+            query = query.filter(exception_type=exception_type)
 
-        exceptions = (
-            query.order_by(desc(CapturedException.created_at)).offset(offset).limit(limit).all()
-        )
+        exceptions = await query.order_by("-created_at").offset(offset).limit(limit)
 
         return [
             ExceptionDetail(
@@ -428,47 +413,46 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
 
     @router.get("/stats", response_model=DashboardStats)
     async def get_stats(
-        hours: int = Query(1, ge=1, le=720),  # Allow up to 30 days
+        hours: int = Query(1, ge=1, le=720),
         slow_threshold: int = Query(100),
-        session: Session = Depends(get_db),
     ):
         since = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-        requests = (
-            session.query(
-                func.count().label("total_requests"),
-                func.avg(CapturedRequest.duration_ms).label("avg_response_time"),
+        # Requests stats
+        req_stats = (
+            await CapturedRequest
+            .filter(created_at__gte=since)
+            .annotate(
+                total_requests=Count("id"),
+                avg_response_time=Avg("duration_ms"),
             )
-            .filter(CapturedRequest.created_at >= since)
-            .one()
+            .values("total_requests", "avg_response_time")
         )
 
-        queries = (
-            session.query(
-                func.count().label("total_queries"),
-                func.avg(CapturedQuery.duration_ms).label("avg_query_time"),
-                func.sum(case((CapturedQuery.duration_ms >= slow_threshold, 1), else_=0)).label(
-                    "slow_queries"
-                ),
-            )
-            .filter(CapturedQuery.created_at >= since)
-            .one()
-        )
+        if req_stats:
+            total_requests = req_stats[0]["total_requests"] or 0
+            avg_response_time = req_stats[0]["avg_response_time"] or 0.0
+        else:
+            total_requests = 0
+            avg_response_time = 0.0
 
-        exceptions = (
-            session.query(func.count().label("total_exceptions"))
-            .filter(CapturedException.created_at >= since)
-            .one()
-        )
+        # Queries stats
+        # Tortoise doesn't support conditional sum easily in one query without raw SQL or advanced expressions.
+        # We can run two queries or use raw SQL.
+        # Let's try to use raw SQL for efficiency or just simple count for slow queries.
 
-        total_requests = requests.total_requests
-        avg_response_time = requests.avg_response_time
+        query_stats = await CapturedQuery.filter(created_at__gte=since).annotate(total_queries=Count("id"), avg_query_time=Avg("duration_ms")).values("total_queries", "avg_query_time")
 
-        total_queries = queries.total_queries
-        avg_query_time = queries.avg_query_time
-        slow_queries = queries.slow_queries or 0
+        slow_queries = await CapturedQuery.filter(created_at__gte=since, duration_ms__gte=slow_threshold).count()
 
-        total_exceptions = exceptions.total_exceptions
+        if query_stats:
+            total_queries = query_stats[0]["total_queries"] or 0
+            avg_query_time = query_stats[0]["avg_query_time"] or 0.0
+        else:
+            total_queries = 0
+            avg_query_time = 0.0
+
+        total_exceptions = await CapturedException.filter(created_at__gte=since).count()
 
         requests_per_minute = total_requests / (hours * 60)
 
@@ -483,16 +467,17 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
         )
 
     @router.delete("/clear")
-    async def clear_data(
-        older_than_hours: Optional[int] = None, session: Session = Depends(get_db)
-    ):
+    async def clear_data(older_than_hours: Optional[int] = None):
         if older_than_hours:
             cutoff = datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
-            session.query(CapturedRequest).filter(CapturedRequest.created_at < cutoff).delete()
+            await CapturedRequest.filter(created_at__lt=cutoff).delete()
         else:
-            session.query(CapturedRequest).delete()
+            await CapturedRequest.all().delete()
+            # Also clear others? Cascading?
+            # CapturedQuery and Exception don't have FKs so we should delete them manually if we want clean state.
+            await CapturedQuery.all().delete()
+            await CapturedException.all().delete()
 
-        session.commit()
         return {"message": "Data cleared successfully"}
 
     # Tracing-related API endpoints
@@ -505,20 +490,19 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
         service_name: Optional[str] = Query(None),
         min_duration_ms: Optional[float] = Query(None),
         hours: int = Query(24, ge=1, le=720),
-        session: Session = Depends(get_db),
     ):
         """List traces."""
         since = datetime.now(timezone.utc) - timedelta(hours=hours)
-        query = session.query(Trace).filter(Trace.created_at >= since)
+        query = Trace.filter(created_at__gte=since)
 
         if status:
-            query = query.filter(Trace.status == status)
+            query = query.filter(status=status)
         if service_name:
-            query = query.filter(Trace.service_name == service_name)
+            query = query.filter(service_name=service_name)
         if min_duration_ms:
-            query = query.filter(Trace.duration_ms >= min_duration_ms)
+            query = query.filter(duration_ms__gte=min_duration_ms)
 
-        traces = query.order_by(desc(Trace.start_time)).offset(offset).limit(limit).all()
+        traces = await query.order_by("-start_time").offset(offset).limit(limit)
 
         return [
             TraceSummary(
@@ -536,18 +520,15 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
         ]
 
     @router.get("/traces/{trace_id}", response_model=TraceDetail)
-    async def get_trace_detail(
-        trace_id: str,
-        session: Session = Depends(get_db),
-    ):
+    async def get_trace_detail(trace_id: str):
         """Get trace details."""
-        trace = session.query(Trace).filter(Trace.trace_id == trace_id).first()
+        trace = await Trace.filter(trace_id=trace_id).first()
         if not trace:
             raise HTTPException(status_code=404, detail="Trace not found")
 
         # Fetch waterfall data
-        tracing_manager = TracingManager(lambda: get_session_context())
-        waterfall_spans = tracing_manager.get_waterfall_data(trace_id)
+        tracing_manager = TracingManager()
+        waterfall_spans = await tracing_manager.get_waterfall_data(trace_id)
 
         return TraceDetail(
             trace_id=trace.trace_id,
@@ -564,18 +545,14 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
         )
 
     @router.get("/traces/{trace_id}/waterfall")
-    async def get_trace_waterfall(
-        trace_id: str,
-        session: Session = Depends(get_db),
-    ):
+    async def get_trace_waterfall(trace_id: str):
         """Get optimized waterfall data for a trace."""
-        # Ensure the trace exists
-        trace = session.query(Trace).filter(Trace.trace_id == trace_id).first()
+        trace = await Trace.filter(trace_id=trace_id).first()
         if not trace:
             raise HTTPException(status_code=404, detail="Trace not found")
 
-        tracing_manager = TracingManager(lambda: get_session_context())
-        waterfall_data = tracing_manager.get_waterfall_data(trace_id)
+        tracing_manager = TracingManager()
+        waterfall_data = await tracing_manager.get_waterfall_data(trace_id)
 
         return {
             "trace_id": trace_id,
@@ -590,12 +567,9 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
         }
 
     @router.get("/spans/{span_id}")
-    async def get_span_detail(
-        span_id: str,
-        session: Session = Depends(get_db),
-    ):
+    async def get_span_detail(span_id: str):
         """Get span details."""
-        span = session.query(Span).filter(Span.span_id == span_id).first()
+        span = await Span.filter(span_id=span_id).first()
         if not span:
             raise HTTPException(status_code=404, detail="Span not found")
 
@@ -621,17 +595,16 @@ def create_api_router(get_session_context, auth_dependency: Optional[Callable] =
         offset: int = Query(0, ge=0),
         status: Optional[str] = None,
         request_id: Optional[str] = None,
-        session: Session = Depends(get_db),
     ):
         """Get background tasks with optional filters."""
-        query = session.query(BackgroundTask)
+        query = BackgroundTask.all()
 
         if status:
-            query = query.filter(BackgroundTask.status == status)
+            query = query.filter(status=status)
         if request_id:
-            query = query.filter(BackgroundTask.request_id == request_id)
+            query = query.filter(request_id=request_id)
 
-        tasks = query.order_by(desc(BackgroundTask.created_at)).offset(offset).limit(limit).all()
+        tasks = await query.order_by("-created_at").offset(offset).limit(limit)
 
         return [
             BackgroundTaskSummary(

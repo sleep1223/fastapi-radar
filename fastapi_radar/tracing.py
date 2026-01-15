@@ -5,8 +5,6 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy.orm import Session
-
 from .models import Span, SpanRelation, Trace
 
 # Trace context for the current request
@@ -62,9 +60,7 @@ class TraceContext:
 
         span_data = self.spans[span_id]
         span_data["end_time"] = datetime.now(timezone.utc)
-        span_data["duration_ms"] = (
-            span_data["end_time"] - span_data["start_time"]
-        ).total_seconds() * 1000
+        span_data["duration_ms"] = (span_data["end_time"] - span_data["start_time"]).total_seconds() * 1000
         span_data["status"] = status
 
         if tags:
@@ -110,9 +106,7 @@ class TraceContext:
         return {
             "trace_id": self.trace_id,
             "service_name": self.service_name,
-            "operation_name": self.spans.get(self.root_span_id, {}).get(
-                "operation_name", "unknown"
-            ),
+            "operation_name": self.spans.get(self.root_span_id, {}).get("operation_name", "unknown"),
             "start_time": start_time,
             "end_time": end_time,
             "duration_ms": (end_time - start_time).total_seconds() * 1000,
@@ -130,27 +124,22 @@ class TraceContext:
 class TracingManager:
     """Tracing manager responsible for persistence and querying."""
 
-    def __init__(self, get_session):
-        self.get_session = get_session
+    def __init__(self):
+        pass
 
-    def save_trace_context(self, trace_ctx: TraceContext):
+    async def save_trace_context(self, trace_ctx: TraceContext):
         """Persist the trace context into the database."""
-        with self.get_session() as session:
-            # Save trace
-            trace_summary = trace_ctx.get_trace_summary()
-            trace = Trace(**trace_summary)
-            session.add(trace)
+        # Save trace
+        trace_summary = trace_ctx.get_trace_summary()
+        await Trace.create(**trace_summary)
 
-            # Save spans
-            for span_data in trace_ctx.spans.values():
-                span = Span(**span_data)
-                session.add(span)
+        # Save spans
+        for span_data in trace_ctx.spans.values():
+            await Span.create(**span_data)
 
-            self._save_span_relations(session, trace_ctx)
+        await self._save_span_relations(trace_ctx)
 
-            session.commit()
-
-    def _save_span_relations(self, session: Session, trace_ctx: TraceContext):
+    async def _save_span_relations(self, trace_ctx: TraceContext):
         """Store parent-child span relations for optimized querying."""
 
         def calculate_depth(span_id: str, spans: Dict[str, Dict], depth: int = 0) -> List[tuple]:
@@ -173,72 +162,71 @@ class TracingManager:
             relations = calculate_depth(trace_ctx.root_span_id, trace_ctx.spans)
 
             for parent_id, child_id, depth in relations:
-                relation = SpanRelation(
+                await SpanRelation.create(
                     trace_id=trace_ctx.trace_id,
                     parent_span_id=parent_id,
                     child_span_id=child_id,
                     depth=depth,
                 )
-                session.add(relation)
 
-    def get_waterfall_data(self, trace_id: str) -> List[Dict[str, Any]]:
+    async def get_waterfall_data(self, trace_id: str) -> List[Dict[str, Any]]:
         """Return data for the waterfall view."""
-        with self.get_session() as session:
-            # Query optimized for DuckDB
-            from sqlalchemy import text
+        from tortoise import Tortoise
+        import json
 
-            waterfall_query = text(
-                """
-                WITH span_timeline AS (
-                    SELECT
-                        s.span_id,
-                        s.parent_span_id,
-                        s.operation_name,
-                        s.service_name,
-                        s.start_time,
-                        s.end_time,
-                        s.duration_ms,
-                        s.status,
-                        s.tags,
-                        COALESCE(r.depth, 0) as depth,
-                        -- Offset relative to trace start (SQLite compatible)
-                        (julianday(s.start_time) - MIN(julianday(s.start_time))
-                            OVER (PARTITION BY s.trace_id)) * 86400000 as offset_ms
-                    FROM radar_spans s
-                    LEFT JOIN radar_span_relations r ON s.span_id = r.child_span_id
-                    WHERE s.trace_id = :trace_id
-                )
-                SELECT * FROM span_timeline
-                ORDER BY offset_ms, depth
-            """
+        # SQLite specific query with julianday
+        # If we support other backends, we might need adjustments
+        waterfall_query = """
+            WITH span_timeline AS (
+                SELECT
+                    s.span_id,
+                    s.parent_span_id,
+                    s.operation_name,
+                    s.service_name,
+                    s.start_time,
+                    s.end_time,
+                    s.duration_ms,
+                    s.status,
+                    s.tags,
+                    COALESCE(r.depth, 0) as depth,
+                    -- Offset relative to trace start (SQLite compatible)
+                    (julianday(s.start_time) - MIN(julianday(s.start_time))
+                        OVER (PARTITION BY s.trace_id)) * 86400000 as offset_ms
+                FROM radar_spans s
+                LEFT JOIN radar_span_relations r ON s.span_id = r.child_span_id
+                WHERE s.trace_id = ?
             )
+            SELECT * FROM span_timeline
+            ORDER BY offset_ms, depth
+        """
 
-            result = session.execute(waterfall_query, {"trace_id": trace_id})
+        conn = Tortoise.get_connection("default")
+        result = await conn.execute_query_dict(waterfall_query, [trace_id])
 
-            return [
-                {
-                    "span_id": row.span_id,
-                    "parent_span_id": row.parent_span_id,
-                    "operation_name": row.operation_name,
-                    "service_name": row.service_name,
-                    "start_time": (
-                        row.start_time.isoformat()
-                        if row.start_time and hasattr(row.start_time, "isoformat")
-                        else row.start_time
-                    ),
-                    "end_time": (
-                        row.end_time.isoformat()
-                        if row.end_time and hasattr(row.end_time, "isoformat")
-                        else row.end_time
-                    ),
-                    "duration_ms": row.duration_ms,
-                    "status": row.status,
-                    "tags": row.tags,
-                    "depth": row.depth,
-                    "offset_ms": float(row.offset_ms) if row.offset_ms else 0.0,
-                }
-                for row in result
-            ]
+        return [
+            {
+                "span_id": row["span_id"],
+                "parent_span_id": row["parent_span_id"],
+                "operation_name": row["operation_name"],
+                "service_name": row["service_name"],
+                "start_time": (
+                    row["start_time"].isoformat()
+                    if row["start_time"] and hasattr(row["start_time"], "isoformat")
+                    else row["start_time"]
+                ),
+                "end_time": (
+                    row["end_time"].isoformat()
+                    if row["end_time"] and hasattr(row["end_time"], "isoformat")
+                    else row["end_time"]
+                ),
+                "duration_ms": row["duration_ms"],
+                "status": row["status"],
+                "tags": (json.loads(row["tags"]) if isinstance(row["tags"], str) else row["tags"]),
+                "depth": row["depth"],
+                "offset_ms": float(row["offset_ms"]) if row["offset_ms"] else 0.0,
+            }
+            for row in result
+        ]
 
 
 def get_current_trace_context() -> Optional[TraceContext]:

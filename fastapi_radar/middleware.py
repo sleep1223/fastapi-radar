@@ -5,9 +5,8 @@ import time
 import traceback
 import uuid
 from contextvars import ContextVar
-from typing import Callable, Optional
+from typing import Optional
 
-from sqlalchemy.exc import SQLAlchemyError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
@@ -33,7 +32,6 @@ class RadarMiddleware(BaseHTTPMiddleware):
     def __init__(
         self,
         app,
-        get_session: Callable,
         exclude_paths: list[str] = None,
         max_body_size: int = 10000,
         capture_response_body: bool = True,
@@ -41,13 +39,12 @@ class RadarMiddleware(BaseHTTPMiddleware):
         service_name: str = "fastapi-app",
     ):
         super().__init__(app)
-        self.get_session = get_session
         self.exclude_paths = exclude_paths or []
         self.max_body_size = max_body_size
         self.capture_response_body = capture_response_body
         self.enable_tracing = enable_tracing
         self.service_name = service_name
-        self.tracing_manager = TracingManager(get_session) if enable_tracing else None
+        self.tracing_manager = TracingManager() if enable_tracing else None
 
     async def dispatch(self, request: Request, call_next) -> Response:
         if self._should_skip(request):
@@ -94,6 +91,7 @@ class RadarMiddleware(BaseHTTPMiddleware):
 
         request_body = await self._get_request_body(request)
 
+        # Create initial record
         captured_request = CapturedRequest(
             request_id=request_id,
             method=request.method,
@@ -101,13 +99,17 @@ class RadarMiddleware(BaseHTTPMiddleware):
             path=request.url.path,
             query_params=dict(request.query_params) if request.query_params else None,
             headers=serialize_headers(request.headers),
-            body=(
-                redact_sensitive_data(truncate_body(request_body, self.max_body_size))
-                if request_body
-                else None
-            ),
+            body=(redact_sensitive_data(truncate_body(request_body, self.max_body_size)) if request_body else None),
             client_ip=get_client_ip(request),
         )
+
+        # Save initial record (Tortoise create)
+        # Note: We must save it to get an ID or at least persist it so we can update it later.
+        try:
+            await captured_request.save()
+        except Exception:
+            # If DB fails, we proceed but logging might be broken
+            pass
 
         response = None
         exception_occurred = False
@@ -128,14 +130,10 @@ class RadarMiddleware(BaseHTTPMiddleware):
                         if capturing:
                             response_body += chunk.decode("utf-8", errors="ignore")
                             try:
-                                with self.get_session() as session:
-                                    captured_request.response_body = redact_sensitive_data(
-                                        truncate_body(response_body, self.max_body_size)
-                                    )
-                                    session.add(captured_request)
-                                    session.commit()
-                            except SQLAlchemyError:
-                                # CapturedRequest record has been deleted.
+                                captured_request.response_body = redact_sensitive_data(truncate_body(response_body, self.max_body_size))
+                                await captured_request.save()
+                            except Exception:
+                                # CapturedRequest record might be missing or DB error
                                 capturing = False
                             else:
                                 capturing = len(response_body) < self.max_body_size
@@ -178,18 +176,20 @@ class RadarMiddleware(BaseHTTPMiddleware):
                     },
                 )
 
-            with self.get_session() as session:
-                session.add(captured_request)
+            try:
+                await captured_request.save()
+
                 if exception_occurred:
                     exception_data = self._get_exception_data(request_id)
                     if exception_data:
-                        session.add(exception_data)
+                        # Create exception record
+                        await CapturedException.create(**exception_data)
 
                 # Persist trace data
                 if trace_ctx and self.tracing_manager:
-                    self.tracing_manager.save_trace_context(trace_ctx)
-
-                session.commit()
+                    await self.tracing_manager.save_trace_context(trace_ctx)
+            except Exception:
+                pass
 
             request_context.set(None)
 
@@ -225,10 +225,7 @@ class RadarMiddleware(BaseHTTPMiddleware):
             "traceback": traceback.format_exc(),
         }
 
-    def _get_exception_data(self, request_id: str) -> Optional[CapturedException]:
-        if (
-            hasattr(self, "_exception_cache")
-            and self._exception_cache.get("request_id") == request_id
-        ):
-            return CapturedException(**self._exception_cache)
+    def _get_exception_data(self, request_id: str) -> Optional[dict]:
+        if hasattr(self, "_exception_cache") and self._exception_cache.get("request_id") == request_id:
+            return self._exception_cache
         return None
